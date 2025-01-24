@@ -2,19 +2,20 @@
 
 use alloc::vec;
 
-use smoltcp::{phy, time::Instant};
-
-use crate::{
-    buffer::{RxBuffer, TxBuffer},
-    AnyNetworkDevice,
+use aster_bigtcp::{
+    device::{self, NotifyDevice},
+    time::Instant,
 };
+use ostd::mm::VmWriter;
 
-impl phy::Device for dyn AnyNetworkDevice {
+use crate::{buffer::RxBuffer, AnyNetworkDevice};
+
+impl device::Device for dyn AnyNetworkDevice {
     type RxToken<'a> = RxToken;
     type TxToken<'a> = TxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if self.can_receive() {
+        if self.can_receive() && self.can_send() {
             let rx_buffer = self.receive().unwrap();
             Some((RxToken(rx_buffer), TxToken(self)))
         } else {
@@ -30,33 +31,41 @@ impl phy::Device for dyn AnyNetworkDevice {
         }
     }
 
-    fn capabilities(&self) -> phy::DeviceCapabilities {
+    fn capabilities(&self) -> device::DeviceCapabilities {
         self.capabilities()
     }
 }
+
+impl NotifyDevice for dyn AnyNetworkDevice {
+    fn notify_poll_end(&mut self) {
+        self.notify_poll_end();
+    }
+}
+
 pub struct RxToken(RxBuffer);
 
-impl phy::RxToken for RxToken {
-    fn consume<R, F>(mut self, f: F) -> R
+impl device::RxToken for RxToken {
+    fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
-        let packet_but = self.0.packet_mut();
-        f(packet_but)
+        let mut packet = self.0.packet();
+        let mut buffer = vec![0u8; packet.remain()];
+        packet.read(&mut VmWriter::from(&mut buffer as &mut [u8]));
+        f(&buffer)
     }
 }
 
 pub struct TxToken<'a>(&'a mut dyn AnyNetworkDevice);
 
-impl<'a> phy::TxToken for TxToken<'a> {
+impl device::TxToken for TxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
         let mut buffer = vec![0u8; len];
         let res = f(&mut buffer);
-        let tx_buffer = TxBuffer::new(&buffer);
-        self.0.send(tx_buffer).expect("Send packet failed");
+        self.0.send(&buffer).expect("Send packet failed");
         res
     }
 }

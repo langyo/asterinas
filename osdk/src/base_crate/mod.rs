@@ -1,21 +1,96 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! The base crate is the OSDK generated crate that is ultimately built by cargo.
-//! It will depend on the kernel crate.
-//!
+//! It will depend on the to-be-built kernel crate or the to-be-tested crate.
 
 use std::{
     fs,
+    io::{Read, Result},
     path::{Path, PathBuf},
     str::FromStr,
 };
 
 use crate::util::get_cargo_metadata;
 
+/// Compares two files byte-by-byte to check if they are identical.
+/// Returns `Ok(true)` if files are identical, `Ok(false)` if they are different, or `Err` if any I/O operation fails.
+fn are_files_identical(file1: &PathBuf, file2: &PathBuf) -> Result<bool> {
+    // Check file size first
+    let metadata1 = fs::metadata(file1)?;
+    let metadata2 = fs::metadata(file2)?;
+
+    if metadata1.len() != metadata2.len() {
+        return Ok(false); // Different sizes, not identical
+    }
+
+    // Compare file contents byte-by-byte
+    let mut file1 = fs::File::open(file1)?;
+    let mut file2 = fs::File::open(file2)?;
+
+    let mut buffer1 = [0u8; 4096];
+    let mut buffer2 = [0u8; 4096];
+
+    loop {
+        let bytes_read1 = file1.read(&mut buffer1)?;
+        let bytes_read2 = file2.read(&mut buffer2)?;
+
+        if bytes_read1 != bytes_read2 || buffer1[..bytes_read1] != buffer2[..bytes_read1] {
+            return Ok(false); // Files are different
+        }
+
+        if bytes_read1 == 0 {
+            return Ok(true); // End of both files, identical
+        }
+    }
+}
+
+/// Create a new base crate that will be built by cargo.
+///
+/// The dependencies of the base crate will be the target crate. If
+/// `link_unit_test_runner` is set to true, the base crate will also depend on
+/// the `ostd-test-runner` crate.
 pub fn new_base_crate(
     base_crate_path: impl AsRef<Path>,
     dep_crate_name: &str,
     dep_crate_path: impl AsRef<Path>,
+    link_unit_test_runner: bool,
+) {
+    // Check if the existing crate base is reusable. Crate bases for ktest are never reusable.
+    if !base_crate_path.as_ref().ends_with("test-base") && base_crate_path.as_ref().exists() {
+        let base_crate_tmp_path = base_crate_path.as_ref().join("tmp");
+        do_new_base_crate(
+            &base_crate_tmp_path,
+            dep_crate_name,
+            &dep_crate_path,
+            link_unit_test_runner,
+        );
+        let cargo_result = are_files_identical(
+            &base_crate_path.as_ref().join("Cargo.toml"),
+            &base_crate_tmp_path.join("Cargo.toml"),
+        );
+        let main_rs_result = are_files_identical(
+            &base_crate_path.as_ref().join("src").join("main.rs"),
+            &base_crate_tmp_path.join("src").join("main.rs"),
+        );
+        std::fs::remove_dir_all(&base_crate_tmp_path).unwrap();
+        if cargo_result.is_ok_and(|res| res) && main_rs_result.is_ok_and(|res| res) {
+            info!("Reusing existing base crate");
+            return;
+        }
+    }
+    do_new_base_crate(
+        base_crate_path,
+        dep_crate_name,
+        dep_crate_path,
+        link_unit_test_runner,
+    );
+}
+
+fn do_new_base_crate(
+    base_crate_path: impl AsRef<Path>,
+    dep_crate_name: &str,
+    dep_crate_path: impl AsRef<Path>,
+    link_unit_test_runner: bool,
 ) {
     let workspace_root = {
         let meta = get_cargo_metadata(None::<&str>, None::<&[&str]>).unwrap();
@@ -26,7 +101,7 @@ pub fn new_base_crate(
         std::fs::remove_dir_all(&base_crate_path).unwrap();
     }
 
-    let dep_crate_version = {
+    let (dep_crate_version, dep_crate_features) = {
         let cargo_toml = dep_crate_path.as_ref().join("Cargo.toml");
         let cargo_toml = fs::read_to_string(cargo_toml).unwrap();
         let cargo_toml: toml::Value = toml::from_str(&cargo_toml).unwrap();
@@ -38,8 +113,13 @@ pub fn new_base_crate(
             .get("version")
             .unwrap()
             .as_str()
-            .unwrap();
-        dep_version.to_string()
+            .unwrap()
+            .to_string();
+        let dep_features = cargo_toml
+            .get("features")
+            .map(|f| f.as_table().unwrap().clone())
+            .unwrap_or_default();
+        (dep_version, dep_features)
     };
 
     // Create the directory
@@ -57,31 +137,47 @@ pub fn new_base_crate(
     let original_dir = std::env::current_dir().unwrap();
     std::env::set_current_dir(&base_crate_path).unwrap();
 
-    // Add linker.ld file
-    let linker_ld = include_str!("x86_64.ld.template");
-    fs::write("x86_64.ld", linker_ld).unwrap();
+    // Add linker script files
+    macro_rules! include_linker_script {
+        ([$($linker_script:literal),+]) => {$(
+            fs::write(
+                base_crate_path.as_ref().join($linker_script),
+                include_str!(concat!($linker_script, ".template"))
+            ).unwrap();
+        )+};
+    }
+    // TODO: currently just x86_64 works; add support for other architectures
+    // here when OSTD is ready
+    include_linker_script!(["x86_64.ld", "riscv64.ld"]);
 
-    // Overrite the main.rs file
+    // Overwrite the main.rs file
     let main_rs = include_str!("main.rs.template");
-    // Replace all occurence of `#TARGET_NAME#` with the `dep_crate_name`
+    // Replace all occurrence of `#TARGET_NAME#` with the `dep_crate_name`
     let main_rs = main_rs.replace("#TARGET_NAME#", &dep_crate_name.replace('-', "_"));
     fs::write("src/main.rs", main_rs).unwrap();
 
     // Add dependencies to the Cargo.toml
-    add_manifest_dependency(dep_crate_name, dep_crate_path);
+    add_manifest_dependency(dep_crate_name, dep_crate_path, link_unit_test_runner);
 
     // Copy the manifest configurations from the target crate to the base crate
     copy_profile_configurations(workspace_root);
+
+    // Generate the features by copying the features from the target crate
+    add_feature_entries(dep_crate_name, &dep_crate_features);
 
     // Get back to the original directory
     std::env::set_current_dir(original_dir).unwrap();
 }
 
-fn add_manifest_dependency(crate_name: &str, crate_path: impl AsRef<Path>) {
-    let mainfest_path = "Cargo.toml";
+fn add_manifest_dependency(
+    crate_name: &str,
+    crate_path: impl AsRef<Path>,
+    link_unit_test_runner: bool,
+) {
+    let manifest_path = "Cargo.toml";
 
     let mut manifest: toml::Table = {
-        let content = fs::read_to_string(mainfest_path).unwrap();
+        let content = fs::read_to_string(manifest_path).unwrap();
         toml::from_str(&content).unwrap()
     };
 
@@ -95,16 +191,37 @@ fn add_manifest_dependency(crate_name: &str, crate_path: impl AsRef<Path>) {
 
     let dependencies = manifest.get_mut("dependencies").unwrap();
 
-    let dep = toml::Table::from_str(&format!(
-        "{} = {{ path = \"{}\"}}",
+    let target_dep = toml::Table::from_str(&format!(
+        "{} = {{ path = \"{}\", default-features = false }}",
         crate_name,
         crate_path.as_ref().display()
     ))
     .unwrap();
-    dependencies.as_table_mut().unwrap().extend(dep);
+    dependencies.as_table_mut().unwrap().extend(target_dep);
+
+    if link_unit_test_runner {
+        let dep_str = match option_env!("OSDK_LOCAL_DEV") {
+            Some("1") => {
+                let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                let test_kernel_dir = crate_dir.join("test-kernel");
+                format!(
+                    "osdk-test-kernel = {{ path = \"{}\" }}",
+                    test_kernel_dir.display()
+                )
+            }
+            _ => concat!(
+                "osdk-test-kernel = { version = \"",
+                env!("CARGO_PKG_VERSION"),
+                "\" }"
+            )
+            .to_owned(),
+        };
+        let test_runner_dep = toml::Table::from_str(&dep_str).unwrap();
+        dependencies.as_table_mut().unwrap().extend(test_runner_dep);
+    }
 
     let content = toml::to_string(&manifest).unwrap();
-    fs::write(mainfest_path, content).unwrap();
+    fs::write(manifest_path, content).unwrap();
 }
 
 fn copy_profile_configurations(workspace_root: impl AsRef<Path>) {
@@ -124,8 +241,37 @@ fn copy_profile_configurations(workspace_root: impl AsRef<Path>) {
     // Copy the profile configurations
     let profile = target_manifest.get("profile");
     if let Some(profile) = profile {
-        manifest.insert("profile".to_string(), profile.clone());
+        manifest.insert(
+            "profile".to_string(),
+            toml::Value::Table(profile.as_table().unwrap().clone()),
+        );
     }
+
+    let content = toml::to_string(&manifest).unwrap();
+    fs::write(manifest_path, content).unwrap();
+}
+
+fn add_feature_entries(dep_crate_name: &str, features: &toml::Table) {
+    let manifest_path = "Cargo.toml";
+    let mut manifest: toml::Table = {
+        let content = fs::read_to_string(manifest_path).unwrap();
+        toml::from_str(&content).unwrap()
+    };
+
+    let mut table = toml::Table::new();
+    for (feature, value) in features.iter() {
+        let value = if feature != &"default".to_string() {
+            vec![toml::Value::String(format!(
+                "{}/{}",
+                dep_crate_name, feature
+            ))]
+        } else {
+            value.as_array().unwrap().clone()
+        };
+        table.insert(feature.clone(), toml::Value::Array(value));
+    }
+
+    manifest.insert("features".to_string(), toml::Value::Table(table));
 
     let content = toml::to_string(&manifest).unwrap();
     fs::write(manifest_path, content).unwrap();

@@ -10,9 +10,9 @@
 //!
 //! 1. It implements the `Eq` and `Hash` traits.
 //! 2. The two values of `k1` and `k2` of type `K` equal to each other,
-//! if and only if their hash values equal to each other.
+//!    if and only if their hash values equal to each other.
 //! 3. The hashes of a value of `k` of type `K` cannot change while it
-//! is in a map.
+//!    is in a map.
 //!
 //! Sometimes we want to use `Arc<T>` as the key type for a hash map but cannot do so
 //! since `T` does not satisfy the properties above. For example, a lot of types
@@ -104,7 +104,7 @@
 #![cfg_attr(not(test), no_std)]
 #![feature(coerce_unsized)]
 #![feature(unsize)]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 extern crate alloc;
 
@@ -138,8 +138,21 @@ impl<T: ?Sized> KeyableArc<T> {
     }
 
     /// Creates a new `KeyableWeak` pointer to this allocation.
+    #[inline]
     pub fn downgrade(this: &Self) -> KeyableWeak<T> {
         Arc::downgrade(&this.0).into()
+    }
+
+    /// Gets the number of strong pointers pointing to this allocation.
+    #[inline]
+    pub fn strong_count(this: &Self) -> usize {
+        Arc::strong_count(&this.0)
+    }
+
+    /// Gets the number of weak pointers pointing to this allocation.
+    #[inline]
+    pub fn weak_count(this: &Self) -> usize {
+        Arc::weak_count(&this.0)
     }
 }
 
@@ -190,7 +203,9 @@ impl<T: ?Sized> Eq for KeyableArc<T> {}
 
 impl<T: ?Sized> Ord for KeyableArc<T> {
     fn cmp(&self, other: &Self) -> Ordering {
-        Arc::as_ptr(&self.0).cmp(&Arc::as_ptr(&other.0))
+        Arc::as_ptr(&self.0)
+            .cast::<()>()
+            .cmp(&Arc::as_ptr(&other.0).cast::<()>())
     }
 }
 
@@ -281,7 +296,10 @@ impl<T: ?Sized> Eq for KeyableWeak<T> {}
 
 impl<T: ?Sized> Ord for KeyableWeak<T> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.as_ptr().cmp(&other.0.as_ptr())
+        self.0
+            .as_ptr()
+            .cast::<()>()
+            .cmp(&other.0.as_ptr().cast::<()>())
     }
 }
 
@@ -307,6 +325,12 @@ impl<T: ?Sized> From<Weak<T>> for KeyableWeak<T> {
 impl<T: ?Sized> From<KeyableWeak<T>> for Weak<T> {
     fn from(value: KeyableWeak<T>) -> Self {
         value.0
+    }
+}
+
+impl<T: ?Sized> Clone for KeyableWeak<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 

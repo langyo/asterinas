@@ -2,8 +2,7 @@
 
 //! The framebuffer of Asterinas.
 #![no_std]
-#![forbid(unsafe_code)]
-#![feature(strict_provenance)]
+#![deny(unsafe_code)]
 
 extern crate alloc;
 
@@ -13,9 +12,14 @@ use core::{
     ops::{Index, IndexMut},
 };
 
-use aster_frame::{boot, config::PAGE_SIZE, io_mem::IoMem, sync::SpinLock, vm::VmIo};
 use component::{init_component, ComponentInitError};
 use font8x8::UnicodeFonts;
+use ostd::{
+    boot::{boot_info, memory_region::MemoryRegionType},
+    io_mem::IoMem,
+    mm::{VmIo, PAGE_SIZE},
+    sync::SpinLock,
+};
 use spin::Once;
 
 #[init_component]
@@ -32,10 +36,14 @@ pub(crate) static WRITER: Once<SpinLock<Writer>> = Once::new();
 #[allow(clippy::diverging_sub_expression)]
 pub(crate) fn init() {
     let mut writer = {
-        let framebuffer = boot::framebuffer_arg();
+        let Some(framebuffer) = boot_info().framebuffer_arg else {
+            return;
+        };
         let mut size = 0;
-        for i in aster_frame::vm::FRAMEBUFFER_REGIONS.get().unwrap().iter() {
-            size = i.len();
+        for region in boot_info().memory_regions.iter() {
+            if region.typ() == MemoryRegionType::Framebuffer {
+                size = region.len();
+            }
         }
 
         let page_size = size / PAGE_SIZE;
@@ -50,9 +58,9 @@ pub(crate) fn init() {
             io_mem,
             x_pos: 0,
             y_pos: 0,
-            bytes_per_pixel: (framebuffer.bpp / 8) as usize,
-            width: framebuffer.width as usize,
-            height: framebuffer.height as usize,
+            bytes_per_pixel: (framebuffer.bpp / 8),
+            width: framebuffer.width,
+            height: framebuffer.height,
             buffer: buffer.leak(),
         }
     };
@@ -199,7 +207,8 @@ pub fn _print(args: fmt::Arguments) {
     WRITER
         .get()
         .unwrap()
-        .lock_irq_disabled()
+        .disable_irq()
+        .lock()
         .write_fmt(args)
         .unwrap();
 }

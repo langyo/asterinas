@@ -7,11 +7,12 @@ extern crate log;
 #[macro_use]
 extern crate serde;
 
+mod arch;
 mod base_crate;
 mod bundle;
 mod cli;
 mod commands;
-mod config_manager;
+mod config;
 mod error;
 mod util;
 

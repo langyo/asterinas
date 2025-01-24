@@ -5,7 +5,7 @@ use core::{
     ops::{Add, Sub},
 };
 
-use pod::Pod;
+use ostd::Pod;
 use static_assertions::const_assert;
 
 /// The block index used in the filesystem.
@@ -89,7 +89,7 @@ impl<const N: u16> Sub<u64> for BlockId<N> {
 
 /// Implements the `Step` trait to iterate over `Range<Id>`.
 impl<const N: u16> Step for BlockId<N> {
-    fn steps_between(start: &Self, end: &Self) -> Option<usize> {
+    fn steps_between(start: &Self, end: &Self) -> (usize, Option<usize>) {
         u64::steps_between(&start.0, &end.0)
     }
 

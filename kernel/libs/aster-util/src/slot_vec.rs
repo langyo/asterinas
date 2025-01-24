@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 /// SlotVec is the variant of Vector.
 /// It guarantees that the index of one item remains unchanged during adding
 /// or deleting other items of the vector.
+#[derive(Debug, Clone)]
 pub struct SlotVec<T> {
     // The slots to store items.
     slots: Vec<Option<T>>,
@@ -48,10 +49,14 @@ impl<T> SlotVec<T> {
     ///
     /// Return `None` if `idx` is out of bounds or the item is not exist.
     pub fn get(&self, idx: usize) -> Option<&T> {
-        if idx >= self.slots.len() {
-            return None;
-        }
-        self.slots[idx].as_ref()
+        self.slots.get(idx)?.as_ref()
+    }
+
+    /// Get the mutable reference of the item at position `idx`.
+    ///
+    /// Return `None` if `idx` is out of bounds or the item is not exist.
+    pub fn get_mut(&mut self, idx: usize) -> Option<&mut T> {
+        self.slots.get_mut(idx)?.as_mut()
     }
 
     /// Put an item into the vector.
@@ -118,11 +123,8 @@ impl<T> SlotVec<T> {
     }
 }
 
-impl<T: Clone> Clone for SlotVec<T> {
-    fn clone(&self) -> Self {
-        Self {
-            slots: self.slots.clone(),
-            num_occupied: self.num_occupied,
-        }
+impl Default for SlotVec<()> {
+    fn default() -> Self {
+        Self::new()
     }
 }

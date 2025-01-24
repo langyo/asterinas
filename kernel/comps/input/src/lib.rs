@@ -2,7 +2,7 @@
 
 //! The input devices of Asterinas.
 #![no_std]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![feature(fn_traits)]
 
 extern crate alloc;
@@ -12,9 +12,9 @@ pub mod key;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::{any::Any, fmt::Debug};
 
-use aster_frame::sync::SpinLock;
 use component::{init_component, ComponentInitError};
 use key::{Key, KeyStatus};
+use ostd::sync::SpinLock;
 use spin::Once;
 
 #[derive(Debug, Clone, Copy)]
@@ -23,7 +23,6 @@ pub enum InputEvent {
 }
 
 pub trait InputDevice: Send + Sync + Any + Debug {
-    fn handle_irq(&self) -> Option<()>;
     fn register_callbacks(&self, function: &'static (dyn Fn(InputEvent) + Send + Sync));
 }
 

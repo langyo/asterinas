@@ -2,11 +2,11 @@
 
 use alloc::{sync::Arc, vec::Vec};
 
-use aster_frame::{
+use ostd::{
     bus::{
         mmio::{
             bus::{MmioDevice, MmioDriver},
-            device::MmioCommonDevice,
+            common_device::MmioCommonDevice,
         },
         BusProbeError,
     },

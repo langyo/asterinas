@@ -1,12 +1,13 @@
 <p align="center">
     <img src="docs/src/images/logo_en.svg" alt="asterinas-logo" width="620"><br>
     A secure, fast, and general-purpose OS kernel written in Rust and compatible with Linux<br/>
-    <a href="https://github.com/asterinas/asterinas/actions/workflows/osdk_test.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/osdk_test.yml/badge.svg?event=push" alt="OSDK Test" style="max-width: 100%;"></a>
-    <a href="https://github.com/asterinas/asterinas/actions/workflows/kernel_test.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/kernel_test.yml/badge.svg?event=push" alt="Kernel Test" style="max-width: 100%;"></a>
+    <a href="https://github.com/asterinas/asterinas/actions/workflows/test_osdk.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_osdk.yml/badge.svg?event=push" alt="Test OSDK" style="max-width: 100%;"></a>
+    <a href="https://github.com/asterinas/asterinas/actions/workflows/test_asterinas.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_asterinas.yml/badge.svg?event=push" alt="Test Asterinas" style="max-width: 100%;"></a>
+    <a href="https://asterinas.github.io/benchmark/"><img src="https://github.com/asterinas/asterinas/actions/workflows/benchmark_asterinas.yml/badge.svg" alt="Benchmark Asterinas" style="max-width: 100%;"></a>
     <br/>
 </p>
 
-English | [中文版](README_CN.md)
+English | [中文版](README_CN.md) | [日本語](README_JP.md)
 
 ## Introducing Asterinas
 
@@ -51,7 +52,7 @@ git clone https://github.com/asterinas/asterinas
 2. Run a Docker container as the development environment.
 
 ```bash
-docker run -it --privileged --network=host --device=/dev/kvm -v ./asterinas:/root/asterinas asterinas/asterinas:0.4.0
+docker run -it --privileged --network=host --device=/dev/kvm -v $(pwd)/asterinas:/root/asterinas asterinas/asterinas:0.11.1
 ```
 
 3. Inside the container, go to the project folder to build and run Asterinas.
@@ -72,4 +73,4 @@ See [The Asterinas Book](https://asterinas.github.io/book/) to learn more about 
 Asterinas's source code and documentation primarily use the 
 [Mozilla Public License (MPL), Version 2.0](https://github.com/asterinas/asterinas/blob/main/LICENSE-MPL).
 Select components are under more permissive licenses,
-detailed [here](https://github.com/asterinas/asterinas/blob/main/.licenserc.yaml). For the rationles behind the choice of MPL, see [here](https://asterinas.github.io/book/index.html#licensing).
+detailed [here](https://github.com/asterinas/asterinas/blob/main/.licenserc.yaml). For the rationales behind the choice of MPL, see [here](https://asterinas.github.io/book/index.html#licensing).

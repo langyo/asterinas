@@ -4,11 +4,12 @@ pub mod capability;
 pub mod common_cfg;
 pub mod device;
 pub mod driver;
+pub mod legacy;
 pub(super) mod msix;
 
 use alloc::sync::Arc;
 
-use aster_frame::bus::pci::PCI_BUS;
+use ostd::bus::pci::PCI_BUS;
 use spin::Once;
 
 use self::driver::VirtioPciDriver;

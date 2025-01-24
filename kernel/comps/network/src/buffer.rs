@@ -1,30 +1,99 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::mem::size_of;
+use alloc::{collections::linked_list::LinkedList, sync::Arc};
 
-use align_ext::AlignExt;
-use bytes::BytesMut;
-use pod::Pod;
+use ostd::{
+    mm::{
+        Daddr, DmaDirection, DmaStream, FrameAllocOptions, HasDaddr, Infallible, VmReader,
+        VmWriter, PAGE_SIZE,
+    },
+    sync::{LocalIrqDisabled, SpinLock},
+    Pod,
+};
+use spin::Once;
 
-/// Buffer for receive packet
-#[derive(Debug)]
+use crate::dma_pool::{DmaPool, DmaSegment};
+
+pub struct TxBuffer {
+    dma_stream: DmaStream,
+    nbytes: usize,
+    pool: &'static SpinLock<LinkedList<DmaStream>, LocalIrqDisabled>,
+}
+
+impl TxBuffer {
+    pub fn new<H: Pod>(
+        header: &H,
+        packet: &[u8],
+        pool: &'static SpinLock<LinkedList<DmaStream>, LocalIrqDisabled>,
+    ) -> Self {
+        let header = header.as_bytes();
+        let nbytes = header.len() + packet.len();
+
+        assert!(nbytes <= TX_BUFFER_LEN);
+
+        let dma_stream = if let Some(stream) = pool.lock().pop_front() {
+            stream
+        } else {
+            let segment = FrameAllocOptions::new()
+                .alloc_segment(TX_BUFFER_LEN / PAGE_SIZE)
+                .unwrap();
+            DmaStream::map(segment.into(), DmaDirection::ToDevice, false).unwrap()
+        };
+
+        let tx_buffer = {
+            let mut writer = dma_stream.writer().unwrap();
+            writer.write(&mut VmReader::from(header));
+            writer.write(&mut VmReader::from(packet));
+            Self {
+                dma_stream,
+                nbytes,
+                pool,
+            }
+        };
+
+        tx_buffer.sync();
+        tx_buffer
+    }
+
+    pub fn writer(&self) -> VmWriter<'_, Infallible> {
+        self.dma_stream.writer().unwrap().limit(self.nbytes)
+    }
+
+    fn sync(&self) {
+        self.dma_stream.sync(0..self.nbytes).unwrap();
+    }
+
+    pub fn nbytes(&self) -> usize {
+        self.nbytes
+    }
+}
+
+impl HasDaddr for TxBuffer {
+    fn daddr(&self) -> Daddr {
+        self.dma_stream.daddr()
+    }
+}
+
+impl Drop for TxBuffer {
+    fn drop(&mut self) {
+        self.pool.lock().push_back(self.dma_stream.clone());
+    }
+}
+
 pub struct RxBuffer {
-    /// Packet Buffer, length align 8.
-    buf: BytesMut,
-    /// Header len
+    segment: DmaSegment,
     header_len: usize,
-    /// Packet len
     packet_len: usize,
 }
 
 impl RxBuffer {
-    pub fn new(len: usize, header_len: usize) -> Self {
-        let len = len.align_up(8);
-        let buf = BytesMut::zeroed(len);
+    pub fn new(header_len: usize, pool: &Arc<DmaPool>) -> Self {
+        assert!(header_len <= pool.segment_size());
+        let segment = pool.alloc_segment().unwrap();
         Self {
-            buf,
-            packet_len: 0,
+            segment,
             header_len,
+            packet_len: 0,
         }
     }
 
@@ -33,59 +102,56 @@ impl RxBuffer {
     }
 
     pub fn set_packet_len(&mut self, packet_len: usize) {
+        assert!(self.header_len + packet_len <= RX_BUFFER_LEN);
         self.packet_len = packet_len;
     }
 
-    pub fn buf(&self) -> &[u8] {
-        &self.buf
+    pub fn packet(&self) -> VmReader<'_, Infallible> {
+        self.segment
+            .sync(self.header_len..self.header_len + self.packet_len)
+            .unwrap();
+        self.segment
+            .reader()
+            .unwrap()
+            .skip(self.header_len)
+            .limit(self.packet_len)
     }
 
-    pub fn buf_mut(&mut self) -> &mut [u8] {
-        &mut self.buf
+    pub fn buf(&self) -> VmReader<'_, Infallible> {
+        self.segment
+            .sync(0..self.header_len + self.packet_len)
+            .unwrap();
+        self.segment
+            .reader()
+            .unwrap()
+            .limit(self.header_len + self.packet_len)
     }
 
-    /// Packet payload slice, which is inner buffer excluding VirtioNetHdr.
-    pub fn packet(&self) -> &[u8] {
-        debug_assert!(self.header_len + self.packet_len <= self.buf.len());
-        &self.buf[self.header_len..self.header_len + self.packet_len]
-    }
-
-    /// Mutable packet payload slice.
-    pub fn packet_mut(&mut self) -> &mut [u8] {
-        debug_assert!(self.header_len + self.packet_len <= self.buf.len());
-        &mut self.buf[self.header_len..self.header_len + self.packet_len]
-    }
-
-    pub fn header<H: Pod>(&self) -> H {
-        debug_assert_eq!(size_of::<H>(), self.header_len);
-        H::from_bytes(&self.buf[..size_of::<H>()])
+    pub const fn buf_len(&self) -> usize {
+        self.segment.size()
     }
 }
 
-/// Buffer for transmit packet
-#[derive(Debug)]
-pub struct TxBuffer {
-    buf: BytesMut,
+impl HasDaddr for RxBuffer {
+    fn daddr(&self) -> Daddr {
+        self.segment.daddr()
+    }
 }
 
-impl TxBuffer {
-    pub fn with_len(buf_len: usize) -> Self {
-        Self {
-            buf: BytesMut::zeroed(buf_len),
-        }
-    }
+pub const RX_BUFFER_LEN: usize = 4096;
+pub const TX_BUFFER_LEN: usize = 4096;
+pub static RX_BUFFER_POOL: Once<Arc<DmaPool>> = Once::new();
 
-    pub fn new(buf: &[u8]) -> Self {
-        Self {
-            buf: BytesMut::from(buf),
-        }
-    }
-
-    pub fn buf(&self) -> &[u8] {
-        &self.buf
-    }
-
-    pub fn buf_mut(&mut self) -> &mut [u8] {
-        &mut self.buf
-    }
+pub fn init() {
+    const POOL_INIT_SIZE: usize = 64;
+    const POOL_HIGH_WATERMARK: usize = 128;
+    RX_BUFFER_POOL.call_once(|| {
+        DmaPool::new(
+            RX_BUFFER_LEN,
+            POOL_INIT_SIZE,
+            POOL_HIGH_WATERMARK,
+            DmaDirection::FromDevice,
+            false,
+        )
+    });
 }

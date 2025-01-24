@@ -1,33 +1,58 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
-use core::{fmt::Debug, hint::spin_loop, mem::size_of};
-
-use aster_frame::{offset_of, sync::SpinLock, trap::TrapFrame};
-use aster_network::{
-    buffer::{RxBuffer, TxBuffer},
-    AnyNetworkDevice, EthernetAddr, NetDeviceIrqHandler, VirtioNetError,
+use alloc::{
+    boxed::Box, collections::linked_list::LinkedList, string::ToString, sync::Arc, vec::Vec,
 };
-use aster_util::{field_ptr, slot_vec::SlotVec};
-use log::debug;
-use pod::Pod;
-use smoltcp::phy::{DeviceCapabilities, Medium};
+use core::{fmt::Debug, mem::size_of};
+
+use aster_bigtcp::device::{Checksum, DeviceCapabilities, Medium};
+use aster_network::{
+    AnyNetworkDevice, EthernetAddr, RxBuffer, TxBuffer, VirtioNetError, RX_BUFFER_POOL,
+};
+use aster_util::slot_vec::SlotVec;
+use log::{debug, warn};
+use ostd::{
+    mm::DmaStream,
+    sync::{LocalIrqDisabled, SpinLock},
+    trap::TrapFrame,
+};
 
 use super::{config::VirtioNetConfig, header::VirtioNetHdr};
 use crate::{
     device::{network::config::NetworkFeatures, VirtioDeviceError},
     queue::{QueueError, VirtQueue},
-    transport::VirtioTransport,
+    transport::{ConfigManager, VirtioTransport},
 };
 
 pub struct NetworkDevice {
-    config: VirtioNetConfig,
+    config_manager: ConfigManager<VirtioNetConfig>,
+    // For smoltcp use
+    caps: DeviceCapabilities,
     mac_addr: EthernetAddr,
     send_queue: VirtQueue,
     recv_queue: VirtQueue,
+    // Since the virtio net header remains consistent for each sending packet,
+    // we store it to avoid recreating the header repeatedly.
+    header: VirtioNetHdr,
+    tx_buffers: Vec<Option<TxBuffer>>,
     rx_buffers: SlotVec<RxBuffer>,
-    callbacks: Vec<Box<dyn NetDeviceIrqHandler>>,
     transport: Box<dyn VirtioTransport>,
+    poll_stat: PollStatistics,
+}
+
+/// Structure to track the number of packets sent and received during a single polling process.
+struct PollStatistics {
+    sent_packet: usize,
+    received_packet: usize,
+}
+
+impl PollStatistics {
+    const fn new() -> Self {
+        Self {
+            sent_packet: 0,
+            received_packet: 0,
+        }
+    }
 }
 
 impl NetworkDevice {
@@ -35,34 +60,44 @@ impl NetworkDevice {
         let device_features = NetworkFeatures::from_bits_truncate(device_features);
         let supported_features = NetworkFeatures::support_features();
         let network_features = device_features & supported_features;
+
+        if network_features != device_features {
+            warn!(
+                "Virtio net contains unsupported device features: {:?}",
+                device_features.difference(supported_features)
+            );
+        }
+
         debug!("{:?}", network_features);
         network_features.bits()
     }
 
     pub fn init(mut transport: Box<dyn VirtioTransport>) -> Result<(), VirtioDeviceError> {
-        let virtio_net_config = VirtioNetConfig::new(transport.as_mut());
+        let config_manager = VirtioNetConfig::new_manager(transport.as_ref());
+        let config = config_manager.read_config();
+        debug!("virtio_net_config = {:?}", config);
+        let mac_addr = config.mac;
         let features = NetworkFeatures::from_bits_truncate(Self::negotiate_features(
-            transport.device_features(),
+            transport.read_device_features(),
         ));
-        debug!("virtio_net_config = {:?}", virtio_net_config);
         debug!("features = {:?}", features);
-        let mac_addr = field_ptr!(&virtio_net_config, VirtioNetConfig, mac)
-            .read()
-            .unwrap();
-        let status = field_ptr!(&virtio_net_config, VirtioNetConfig, status)
-            .read()
-            .unwrap();
-        debug!("mac addr = {:x?}, status = {:?}", mac_addr, status);
+
+        let caps = init_caps(&features, &config);
+
+        let mut send_queue = VirtQueue::new(QUEUE_SEND, QUEUE_SIZE, transport.as_mut())
+            .expect("create send queue fails");
+        send_queue.disable_callback();
+
         let mut recv_queue = VirtQueue::new(QUEUE_RECV, QUEUE_SIZE, transport.as_mut())
             .expect("creating recv queue fails");
-        let send_queue = VirtQueue::new(QUEUE_SEND, QUEUE_SIZE, transport.as_mut())
-            .expect("create send queue fails");
+
+        let tx_buffers = (0..QUEUE_SIZE).map(|_| None).collect();
 
         let mut rx_buffers = SlotVec::new();
         for i in 0..QUEUE_SIZE {
-            let mut rx_buffer = RxBuffer::new(RX_BUFFER_LEN, size_of::<VirtioNetHdr>());
-            // FIEME: Replace rx_buffer with VM segment-based data structure to use dma mapping.
-            let token = recv_queue.add_buf(&[], &[rx_buffer.buf_mut()])?;
+            let rx_pool = RX_BUFFER_POOL.get().unwrap();
+            let rx_buffer = RxBuffer::new(size_of::<VirtioNetHdr>(), rx_pool);
+            let token = recv_queue.add_dma_buf(&[], &[&rx_buffer])?;
             assert_eq!(i, token);
             assert_eq!(rx_buffers.put(rx_buffer) as u16, i);
         }
@@ -71,23 +106,30 @@ impl NetworkDevice {
             debug!("notify receive queue");
             recv_queue.notify();
         }
+
         let mut device = Self {
-            config: virtio_net_config.read().unwrap(),
+            config_manager,
+            caps,
             mac_addr,
             send_queue,
             recv_queue,
+            header: VirtioNetHdr::default(),
+            tx_buffers,
             rx_buffers,
             transport,
-            callbacks: Vec::new(),
+            poll_stat: PollStatistics::new(),
         };
-        device.transport.finish_init();
+
         /// Interrupt handler if network device config space changes
         fn config_space_change(_: &TrapFrame) {
             debug!("network device config space change");
         }
 
-        /// Interrupt handler if network device receives some packet
-        fn handle_network_event(_: &TrapFrame) {
+        /// Interrupt handlers if network device receives/sends some packet
+        fn handle_send_event(_: &TrapFrame) {
+            aster_network::handle_send_irq(super::DEVICE_NAME);
+        }
+        fn handle_recv_event(_: &TrapFrame) {
             aster_network::handle_recv_irq(super::DEVICE_NAME);
         }
 
@@ -97,32 +139,42 @@ impl NetworkDevice {
             .unwrap();
         device
             .transport
-            .register_queue_callback(QUEUE_RECV, Box::new(handle_network_event), false)
+            .register_queue_callback(QUEUE_SEND, Box::new(handle_send_event), true)
             .unwrap();
+        device
+            .transport
+            .register_queue_callback(QUEUE_RECV, Box::new(handle_recv_event), true)
+            .unwrap();
+
+        device.transport.finish_init();
 
         aster_network::register_device(
             super::DEVICE_NAME.to_string(),
-            Arc::new(SpinLock::new(Box::new(device))),
+            Arc::new(SpinLock::new(device)),
         );
         Ok(())
     }
 
-    /// Add a rx buffer to recv queue
-    /// FIEME: Replace rx_buffer with VM segment-based data structure to use dma mapping.
-    fn add_rx_buffer(&mut self, mut rx_buffer: RxBuffer) -> Result<(), VirtioNetError> {
+    /// Adds a `RxBuffer` to the receive queue.
+    fn add_rx_buffer(&mut self, rx_buffer: RxBuffer) -> Result<(), VirtioNetError> {
         let token = self
             .recv_queue
-            .add_buf(&[], &[rx_buffer.buf_mut()])
+            .add_dma_buf(&[], &[&rx_buffer])
             .map_err(queue_to_network_error)?;
         assert!(self.rx_buffers.put_at(token as usize, rx_buffer).is_none());
-        if self.recv_queue.should_notify() {
-            self.recv_queue.notify();
+
+        self.poll_stat.received_packet += 1;
+
+        if self.poll_stat.received_packet == QUEUE_SIZE as _ {
+            // If we know there are no free buffers for receiving,
+            // we will notify the receive queue as soon as possible.
+            self.notify_receive_queue();
         }
+
         Ok(())
     }
 
-    /// Receive a packet from network. If packet is ready, returns a RxBuffer containing the packet.
-    /// Otherwise, return NotReady error.
+    /// Receives a packet from network.
     fn receive(&mut self) -> Result<RxBuffer, VirtioNetError> {
         let (token, len) = self.recv_queue.pop_used().map_err(queue_to_network_error)?;
         debug!("receive packet: token = {}, len = {}", token, len);
@@ -130,38 +182,87 @@ impl NetworkDevice {
             .rx_buffers
             .remove(token as usize)
             .ok_or(VirtioNetError::WrongToken)?;
-        rx_buffer.set_packet_len(len as usize);
+        rx_buffer.set_packet_len(len as usize - size_of::<VirtioNetHdr>());
         // FIXME: Ideally, we can reuse the returned buffer without creating new buffer.
         // But this requires locking device to be compatible with smoltcp interface.
-        let new_rx_buffer = RxBuffer::new(RX_BUFFER_LEN, size_of::<VirtioNetHdr>());
+        let rx_pool = RX_BUFFER_POOL.get().unwrap();
+        let new_rx_buffer = RxBuffer::new(size_of::<VirtioNetHdr>(), rx_pool);
         self.add_rx_buffer(new_rx_buffer)?;
         Ok(rx_buffer)
     }
 
-    /// Send a packet to network. Return until the request completes.
-    /// FIEME: Replace tx_buffer with VM segment-based data structure to use dma mapping.
-    fn send(&mut self, tx_buffer: TxBuffer) -> Result<(), VirtioNetError> {
-        let header = VirtioNetHdr::default();
+    /// Sends a packet to network.
+    fn send(&mut self, packet: &[u8]) -> Result<(), VirtioNetError> {
+        if !self.can_send() {
+            return Err(VirtioNetError::Busy);
+        }
+
+        let tx_buffer = TxBuffer::new(&self.header, packet, &TX_BUFFER_POOL);
+
         let token = self
             .send_queue
-            .add_buf(&[header.as_bytes(), tx_buffer.buf()], &[])
+            .add_dma_buf(&[&tx_buffer], &[])
             .map_err(queue_to_network_error)?;
 
+        self.poll_stat.sent_packet += 1;
+
+        if self.send_queue.available_desc() == 0 {
+            // If the send queue is full,
+            // we will notify the send queue as soon as possible.
+            self.notify_send_queue();
+        }
+
+        debug!("send packet, token = {}, len = {}", token, packet.len());
+
+        debug_assert!(self.tx_buffers[token as usize].is_none());
+        self.tx_buffers[token as usize] = Some(tx_buffer);
+
+        self.free_processed_tx_buffers();
+
+        // If the send queue is not full, we can free the send buffers during the next sending process.
+        // Therefore, there is no need to free the used buffers in the IRQ handlers.
+        // This allows us to temporarily disable the send queue interrupt.
+        // Conversely, if the send queue is full, the send queue interrupt should remain enabled
+        // to free the send buffers as quickly as possible.
+        if !self.can_send() {
+            self.send_queue.enable_callback();
+        } else {
+            self.send_queue.disable_callback();
+        }
+
+        Ok(())
+    }
+
+    fn notify_send_queue(&mut self) {
+        if self.poll_stat.sent_packet == 0 {
+            return;
+        }
+
+        debug!(
+            "notify send queue: sent {} packets",
+            self.poll_stat.sent_packet
+        );
         if self.send_queue.should_notify() {
             self.send_queue.notify();
         }
-        // Wait until the buffer is used
-        while !self.send_queue.can_pop() {
-            spin_loop();
+
+        self.poll_stat.sent_packet = 0;
+    }
+
+    fn notify_receive_queue(&mut self) {
+        if self.poll_stat.received_packet == 0 {
+            return;
         }
-        // Pop out the buffer, so we can reuse the send queue further
-        let (pop_token, _) = self.send_queue.pop_used().map_err(queue_to_network_error)?;
-        debug_assert!(pop_token == token);
-        if pop_token != token {
-            return Err(VirtioNetError::WrongToken);
+
+        debug!(
+            "notify receive queue: received {} packets",
+            self.poll_stat.received_packet
+        );
+        if self.recv_queue.should_notify() {
+            self.recv_queue.notify();
         }
-        debug!("send packet succeeds");
-        Ok(())
+
+        self.poll_stat.received_packet = 0;
     }
 }
 
@@ -169,8 +270,48 @@ fn queue_to_network_error(err: QueueError) -> VirtioNetError {
     match err {
         QueueError::NotReady => VirtioNetError::NotReady,
         QueueError::WrongToken => VirtioNetError::WrongToken,
+        QueueError::BufferTooSmall => VirtioNetError::Busy,
         _ => VirtioNetError::Unknown,
     }
+}
+
+fn init_caps(features: &NetworkFeatures, config: &VirtioNetConfig) -> DeviceCapabilities {
+    let mut caps = DeviceCapabilities::default();
+
+    caps.max_burst_size = None;
+    caps.medium = Medium::Ethernet;
+
+    if features.contains(NetworkFeatures::VIRTIO_NET_F_MTU) {
+        // If `VIRTIO_NET_F_MTU` is negotiated, the MTU is decided by the device.
+        caps.max_transmission_unit = config.mtu as usize;
+    } else {
+        // We do not support these features,
+        // so this asserts that they are _not_ negotiated.
+        //
+        // Without these features, the MTU is 1514 bytes per the virtio-net specification
+        // (see "5.1.6.3 Setting Up Receive Buffers" and "5.1.6.2 Packet Transmission").
+        assert!(
+            !features.contains(NetworkFeatures::VIRTIO_NET_F_GUEST_TSO4)
+                && !features.contains(NetworkFeatures::VIRTIO_NET_F_GUEST_TSO6)
+                && !features.contains(NetworkFeatures::VIRTIO_NET_F_GUEST_UFO)
+        );
+        caps.max_transmission_unit = 1514;
+    }
+
+    // We do not support checksum offloading.
+    // So the features must not be negotiated,
+    // and we must deliver fully checksummed packets to the device
+    // and validate all checksums for packets from the device.
+    assert!(
+        !features.contains(NetworkFeatures::VIRTIO_NET_F_CSUM)
+            && !features.contains(NetworkFeatures::VIRTIO_NET_F_GUEST_CSUM)
+    );
+    caps.checksum.tcp = Checksum::Both;
+    caps.checksum.udp = Checksum::Both;
+    caps.checksum.ipv4 = Checksum::Both;
+    caps.checksum.icmpv4 = Checksum::Both;
+
+    caps
 }
 
 impl AnyNetworkDevice for NetworkDevice {
@@ -179,11 +320,7 @@ impl AnyNetworkDevice for NetworkDevice {
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 1536;
-        caps.max_burst_size = Some(1);
-        caps.medium = Medium::Ethernet;
-        caps
+        self.caps.clone()
     }
 
     fn can_receive(&self) -> bool {
@@ -191,22 +328,33 @@ impl AnyNetworkDevice for NetworkDevice {
     }
 
     fn can_send(&self) -> bool {
-        self.send_queue.available_desc() >= 2
+        self.send_queue.available_desc() >= 1
     }
 
     fn receive(&mut self) -> Result<RxBuffer, VirtioNetError> {
         self.receive()
     }
 
-    fn send(&mut self, tx_buffer: TxBuffer) -> Result<(), VirtioNetError> {
-        self.send(tx_buffer)
+    fn send(&mut self, packet: &[u8]) -> Result<(), VirtioNetError> {
+        self.send(packet)
+    }
+
+    fn free_processed_tx_buffers(&mut self) {
+        while let Ok((token, _)) = self.send_queue.pop_used() {
+            self.tx_buffers[token as usize] = None;
+        }
+    }
+
+    fn notify_poll_end(&mut self) {
+        self.notify_send_queue();
+        self.notify_receive_queue();
     }
 }
 
 impl Debug for NetworkDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("NetworkDevice")
-            .field("config", &self.config)
+            .field("config", &self.config_manager.read_config())
             .field("mac_addr", &self.mac_addr)
             .field("send_queue", &self.send_queue)
             .field("recv_queue", &self.recv_queue)
@@ -215,8 +363,10 @@ impl Debug for NetworkDevice {
     }
 }
 
+static TX_BUFFER_POOL: SpinLock<LinkedList<DmaStream>, LocalIrqDisabled> =
+    SpinLock::new(LinkedList::new());
+
 const QUEUE_RECV: u16 = 0;
 const QUEUE_SEND: u16 = 1;
 
 const QUEUE_SIZE: u16 = 64;
-const RX_BUFFER_LEN: usize = 4096;

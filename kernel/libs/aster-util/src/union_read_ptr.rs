@@ -2,7 +2,7 @@
 
 use core::marker::PhantomData;
 
-use pod::Pod;
+use ostd::Pod;
 
 /// This ptr is designed to read union field safely.
 /// Write to union field is safe operation. While reading union field is UB.
@@ -37,7 +37,7 @@ macro_rules! read_union_fields {
         union_read_ptr.read_at(offset)
     });
     ($container:ident.$($field:ident).*) => ({
-        let field_offset = aster_frame::value_offset!($container.$($field).*);
+        let field_offset = ostd::value_offset!($container.$($field).*);
         let union_read_ptr = UnionReadPtr::new(&*$container);
         union_read_ptr.read_at(field_offset)
     });

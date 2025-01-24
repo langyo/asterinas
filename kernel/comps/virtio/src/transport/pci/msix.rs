@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use aster_frame::{bus::pci::capability::msix::CapabilityMsixData, trap::IrqLine};
+use ostd::{bus::pci::capability::msix::CapabilityMsixData, trap::IrqLine};
 
 pub struct VirtioMsixManager {
     config_msix_vector: u16,
@@ -20,7 +20,7 @@ impl VirtioMsixManager {
     pub fn new(mut msix: CapabilityMsixData) -> Self {
         let mut msix_vector_list: Vec<u16> = (0..msix.table_size()).collect();
         for i in msix_vector_list.iter() {
-            let irq = aster_frame::trap::IrqLine::alloc().unwrap();
+            let irq = ostd::trap::IrqLine::alloc().unwrap();
             msix.set_interrupt_vector(irq, *i);
         }
         let config_msix_vector = msix_vector_list.pop().unwrap();
@@ -42,10 +42,10 @@ impl VirtioMsixManager {
         )
     }
 
-    /// Get shared interrupt IRQ used by virtqueue. If a virtqueue will not send interrupt frequently.
+    /// Get shared IRQ line used by virtqueue. If a virtqueue will not send interrupt frequently.
     /// Then this virtqueue should use shared interrupt IRQ.
     /// This function will return the MSI-X vector and corresponding IRQ.
-    pub fn shared_interrupt_irq(&mut self) -> (u16, &mut IrqLine) {
+    pub fn shared_irq_line(&mut self) -> (u16, &mut IrqLine) {
         (
             self.shared_interrupt_vector,
             self.msix
@@ -61,5 +61,10 @@ impl VirtioMsixManager {
         let vector = self.unused_msix_vectors.pop()?;
         self.used_msix_vectors.push(vector);
         Some((vector, self.msix.irq_mut(vector as usize).unwrap()))
+    }
+
+    /// Returns true if MSI-X is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.msix.is_enabled()
     }
 }

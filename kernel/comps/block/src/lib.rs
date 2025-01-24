@@ -12,7 +12,7 @@
 //! and merge requests within the queue.
 //!
 //! This crate also offers the `Bio` related data structures and APIs to accomplish
-//! safe and convenient block I/O operations, for exmaple:
+//! safe and convenient block I/O operations, for example:
 //!
 //! ```no_run
 //! // Creates a bio request.
@@ -27,9 +27,10 @@
 //! ```
 //!
 #![no_std]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![feature(fn_traits)]
 #![feature(step_trait)]
+#![feature(trait_upcasting)]
 #![allow(dead_code)]
 
 extern crate alloc;
@@ -40,8 +41,8 @@ mod impl_block_device;
 mod prelude;
 pub mod request_queue;
 
-use aster_frame::sync::SpinLock;
 use component::{init_component, ComponentInitError};
+use ostd::sync::SpinLock;
 use spin::Once;
 
 use self::{
@@ -49,13 +50,25 @@ use self::{
     prelude::*,
 };
 
-pub const BLOCK_SIZE: usize = aster_frame::config::PAGE_SIZE;
+pub const BLOCK_SIZE: usize = ostd::mm::PAGE_SIZE;
 pub const SECTOR_SIZE: usize = 512;
 
 pub trait BlockDevice: Send + Sync + Any + Debug {
     /// Enqueues a new `SubmittedBio` to the block device.
     fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError>;
-    fn handle_irq(&self);
+
+    /// Returns the metadata of the block device.
+    fn metadata(&self) -> BlockDeviceMeta;
+}
+
+/// Metadata for a block device.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockDeviceMeta {
+    /// The upper limit for the number of segments per bio.
+    pub max_nr_segments_per_bio: usize,
+    /// The total number of sectors of the block device.
+    pub nr_sectors: usize,
+    // Additional useful metadata can be added here in the future.
 }
 
 impl dyn BlockDevice {

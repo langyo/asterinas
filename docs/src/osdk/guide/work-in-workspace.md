@@ -2,7 +2,7 @@
 
 Typically, an operating system may consist of multiple crates,
 and these crates may be organized in a workspace.
-OSDK also supports managing projects in a workspace.
+The OSDK also supports managing projects in a workspace.
 Below is an example that demonstrates
 how to create, build, run, and test projects in a workspace.
 
@@ -18,9 +18,7 @@ touch Cargo.toml
 Then, add the following content to `Cargo.toml`:
 
 ```toml
-[workspace]
-members = []
-resolver = "2"
+{{#include ../../../../osdk/tests/examples_in_book/work_in_workspace_templates/Cargo.toml}}
 ```
 
 ## Creating a kernel project and a library project
@@ -29,7 +27,7 @@ The two projects can be created using the following commands:
 
 ```bash
 cargo osdk new --kernel myos
-cargo osdk new mymodule
+cargo osdk new mylib
 ```
 
 The generated directory structure will be as follows:
@@ -43,44 +41,39 @@ myworkspace/
   │   ├── Cargo.toml
   │   └── src/
   │       └── lib.rs
-  └── mymodule/
+  └── mylib/
       ├── Cargo.toml
       └── src/
           └── lib.rs
 ```
 
+At present, the OSDK mandates that there must be only one kernel project
+within a workspace.
+
 In addition to the two projects,
-OSDK will also generate `OSDK.toml` and `rust-toolchain.toml`
+the OSDK will also generate `OSDK.toml` and `rust-toolchain.toml`
 at the root of the workspace.
 
-Next, add the following function to `mymodule/src/lib.rs`.
+Next, add the following function to `mylib/src/lib.rs`.
 This function will calculate the available memory
 after booting:
 
 ```rust
-pub fn available_memory() -> usize {
-    let regions = aster_frame::boot::memory_regions();
-    regions.iter().map(|region| region.len()).sum()
-}
+{{#include ../../../../osdk/tests/examples_in_book/work_in_workspace_templates/mylib/src/lib.rs}}
 ```
 
-Then, add a dependency on `mymodule` to `myos/Cargo.toml`:
+Then, add a dependency on `mylib` to `myos/Cargo.toml`:
 
 ```toml
-[dependencies]
-mymodule = { path = "../mymodule" }
+{{#include ../../../../osdk/tests/examples_in_book/work_in_workspace_templates/myos/Cargo.toml}}
 ```
 
 In `myos/src/lib.rs`,
-modify the main function as follows.
-This function will call the function from `mymodule`:
+modify the file content as follows.
+This main function will call the function from `mylib`:
 
 ```rust
-#[aster_main]
-fn kernel_main() {
-  let avail_mem_as_mb = mymodule::available_memory() / 1_000_000;
-  println!("The available memory is {} MB", avail_mem_as_mb);
-}
+{{#include ../../../../osdk/tests/examples_in_book/work_in_workspace_templates/myos/src/lib.rs}}
 ```
 
 ## Building and Running the kernel
@@ -107,9 +100,9 @@ cargo osdk test
 If you want to run test cases from a specific crate,
 navigate to the crate's folder
 and run `cargo osdk test`.
-For example, if you want to test `myos`,
+For example, if you want to test `mylib`,
 use the following command:
 
 ```bash
-cd myos && cargo osdk test
+cd mylib && cargo osdk test
 ```

@@ -4,18 +4,31 @@
 
 use std::{
     ffi::OsStr,
-    fs::{self, create_dir_all},
+    fs::{self, create_dir_all, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     process::Output,
 };
 
 use assert_cmd::Command;
+use toml::{Table, Value};
 
-pub fn cargo_osdk<T: AsRef<OsStr>, I: IntoIterator<Item = T>>(args: I) -> Command {
+pub fn cargo_osdk<T: AsRef<OsStr>, I: IntoIterator<Item = T> + Copy>(args: I) -> Command {
     let mut command = Command::cargo_bin("cargo-osdk").unwrap();
     command.arg("osdk");
     command.args(args);
+    conditionally_add_tdx_args(&mut command, args);
     command
+}
+
+pub fn edit_config_files(dir: &Path) {
+    let manifest_path = dir.join("Cargo.toml");
+    assert!(manifest_path.is_file());
+    depends_on_local_ostd(manifest_path);
+    if is_tdx_enabled() {
+        let osdk_path = dir.join("OSDK.toml");
+        add_tdx_scheme(osdk_path).unwrap();
+    };
 }
 
 pub fn assert_success(output: &Output) {
@@ -44,7 +57,10 @@ pub fn create_workspace(workspace_name: &str, members: &[&str]) {
             .map(|member| toml::Value::String(member.to_string()))
             .collect();
 
-        let exclude = toml::Value::Array(vec![toml::Value::String("target/osdk/base".to_string())]);
+        let exclude = toml::Value::Array(vec![
+            toml::Value::String("target/osdk/base".to_string()),
+            toml::Value::String("target/osdk/test-base".to_string()),
+        ]);
 
         table.insert("members".to_string(), toml::Value::Array(members));
         table.insert("exclude".to_string(), exclude);
@@ -58,10 +74,6 @@ pub fn create_workspace(workspace_name: &str, members: &[&str]) {
 
     let content = table.to_string();
     fs::write(manefest_path, content).unwrap();
-
-    // Create OSDK.toml
-    let osdk_manifest_path = PathBuf::from(workspace_name).join("OSDK.toml");
-    fs::write(osdk_manifest_path, "").unwrap();
 
     // Create rust-toolchain.toml which is synced with the Asterinas' toolchain
     let rust_toolchain_path = PathBuf::from(workspace_name).join("rust-toolchain.toml");
@@ -88,4 +100,73 @@ pub fn add_member_to_workspace(workspace: impl AsRef<Path>, new_member: &str) {
 
     let new_content = workspace_manifest.to_string();
     fs::write(&path, new_content).unwrap();
+}
+
+/// Makes crates created by `cargo ostd new` depends on ostd locally,
+/// instead of ostd from remote source(git repo/crates.io).
+///
+/// Each crate created by `cargo ostd new` should add this patch.
+pub(crate) fn depends_on_local_ostd(manifest_path: impl AsRef<Path>) {
+    let crate_dir = env!("CARGO_MANIFEST_DIR");
+    let ostd_dir = PathBuf::from(crate_dir)
+        .join("..")
+        .join("ostd")
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    // FIXME: It may be more elegant to add `patch` section instead of replacing dependency.
+    // But adding `patch` section does not work in my local test, which is confusing.
+
+    let manifest_content = fs::read_to_string(&manifest_path).unwrap();
+    let mut manifest: Table = toml::from_str(&manifest_content).unwrap();
+    let dep = manifest
+        .get_mut("dependencies")
+        .map(Value::as_table_mut)
+        .flatten()
+        .unwrap();
+
+    let mut table = Table::new();
+    table.insert("path".to_string(), Value::String(ostd_dir));
+    dep.insert("ostd".to_string(), Value::Table(table));
+
+    fs::write(manifest_path, manifest.to_string().as_bytes()).unwrap();
+}
+
+pub(crate) fn add_tdx_scheme(osdk_path: impl AsRef<Path>) -> std::io::Result<()> {
+    let template_path = Path::new(file!())
+        .parent()
+        .unwrap()
+        .join("scheme.tdx.template");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .open(osdk_path)?;
+    let tdx_qemu_cfg = fs::read_to_string(template_path)?;
+    file.write_all(format!("\n\n{}", tdx_qemu_cfg).as_bytes())?;
+    Ok(())
+}
+
+pub(crate) fn is_tdx_enabled() -> bool {
+    std::env::var("INTEL_TDX").is_ok_and(|s| s == "1")
+}
+
+fn conditionally_add_tdx_args<T: AsRef<OsStr>, I: IntoIterator<Item = T> + Copy>(
+    command: &mut Command,
+    args: I,
+) {
+    if is_tdx_enabled() && contains_build_run_or_test(args) {
+        command.args(&["--scheme", "tdx"]);
+    }
+}
+
+fn contains_build_run_or_test<T: AsRef<OsStr>, I: IntoIterator<Item = T>>(args: I) -> bool {
+    args.into_iter().any(|arg| {
+        if let Some(arg_str) = arg.as_ref().to_str() {
+            arg_str == "build" || arg_str == "run" || arg_str == "test"
+        } else {
+            false
+        }
+    })
 }
